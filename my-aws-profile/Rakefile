@@ -1,0 +1,98 @@
+# Rakefile
+
+require 'json'
+require 'yaml'
+
+def add_random_string(length = 25)
+  (0...length).map { rand(65..90).chr }.join.downcase.to_s
+end
+
+def get_tf_output_vars(outputs_file)
+  outputs = []
+  File.read(outputs_file).lines.each do |line|
+    next unless line.start_with?('output')
+    outputs += [line.sub(/^output \"/, '').sub(/\" {\n/, '')]
+  end
+  outputs
+end
+
+def update_yaml(file_name, output_file)
+  contents = YAML.load_file(file_name)
+  outputs = get_tf_output_vars(output_file)
+  outputs.each do |tf|
+    value = `terraform output #{tf}`.strip.gsub('"', '')
+    contents[tf.to_sym] = value
+  end
+  File.open(file_name, 'w') do |f|
+    f.write(YAML.dump(contents))
+  end
+end
+
+def write_log(text)
+  puts "-----> #{text}"
+end
+
+WORKING_DIR = File.dirname(__FILE__).freeze
+INTEGRATION_DIR = File.join(WORKING_DIR, 'test', 'integration')
+CONTROLS_DIR = File.join(INTEGRATION_DIR, 'verify')
+TERRAFORM_DIR = File.join(INTEGRATION_DIR, 'build')
+TF_VAR_FILE_NAME = 'inspec-aws.tfvars.json'.freeze
+TF_VAR_FILE = File.join(TERRAFORM_DIR, TF_VAR_FILE_NAME)
+TF_PLAN_FILE = 'inspec-aws.plan'.freeze
+TF_OUTPUT_FILE = 'outputs.tf'.freeze
+PROFILE_INPUTS = 'aws-inspec-inputs.yaml'.freeze
+
+config = {
+  aws_profile: ENV['AWS_PROFILE'],
+  aws_region: 'us-west-2',
+  aws_vpc_cidr_block: '10.0.0.0/27',
+  aws_vpc_instance_tenancy: 'default',
+  aws_vpc_name: "inspec-aws-vpc-#{add_random_string}",
+}
+
+desc 'Execute Terraform Apply, Inspex Exec and Terraform Destroy'
+task default: [ :terraform_apply, :inspec_exec, :terraform_cleanup ]
+
+desc 'Execute Terraform Apply'
+task :terraform_apply do
+  Dir.chdir(TERRAFORM_DIR)
+
+  write_log('Initializing Terraform')
+  cmd_tf_init = format('terraform init')
+  sh(cmd_tf_init)
+
+  write_log('Generating Terraform and InSpec variable files')
+  File.open(TF_VAR_FILE_NAME, 'w')  { |f| f.write(config.to_json) }
+  File.open(PROFILE_INPUTS, 'w')    { |f| f.write(YAML.dump(config)) }
+
+  write_log('Generating the Plan')
+  cmd_tf_plan = format('terraform plan -var-file=%s -out %s', TF_VAR_FILE_NAME, TF_PLAN_FILE)
+  sh(cmd_tf_plan)
+
+  write_log('Applying the plan')
+  cmd_tf_apply = format('terraform apply %s', TF_PLAN_FILE)
+  sh(cmd_tf_apply)
+
+  write_log('Adding terraform outputs to InSpec variable file')
+  update_yaml(PROFILE_INPUTS, TF_OUTPUT_FILE)
+end
+
+desc 'Execute Terraform Destroy'
+task :terraform_cleanup do
+  Dir.chdir(TERRAFORM_DIR)
+
+  write_log('Cleanup Terraform')
+  cmd_tf_destroy = format('terraform destroy -force -var-file=%s', TF_VAR_FILE_NAME)
+  sh(cmd_tf_destroy)
+end
+
+desc 'Execute Inspec Exec with embedded test suite'
+task :inspec_exec do
+  Dir.chdir(WORKING_DIR)
+
+  write_log('Running InSpec tests')
+  target = CONTROLS_DIR
+  cmd = 'inspec exec %s -t aws:// --input-file %s --chef-license=accept-silent --no-distinct-exit'
+  cmd = format(cmd, target, File.join(TERRAFORM_DIR.to_s, PROFILE_INPUTS))
+  sh(cmd)
+end
